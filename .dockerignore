@@ -1,0 +1,12 @@
+.git
+.env
+.venv
+__pycache__
+.pytest_cache
+.ruff_cache
+*.p12
+*.pfx
+*.pem
+*.key
+*.sqlite3
+htmlcov
