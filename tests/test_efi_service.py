@@ -9,9 +9,13 @@ from services.efi_api_client import EfiConfigurationError, EfiOpenFinanceClient
 
 def settings(**overrides):
     opts = {
-        "ADMIN_API_KEY": "admin-test-key-000000000000000000000000000000",
-        "EFI_WEBHOOK_HASH": "webhook-test-hash-00000000000000000000000000",
-        "EFI_ENVIRONMENT": "homologation",
+        "admin_api_key": "admin-test-key-000000000000000000000000000000",
+        "efi_webhook_hash": "webhook-test-hash-00000000000000000000000000",
+        "efi_environment": "homologation",
+        "efi_client_id": None,
+        "efi_client_secret": None,
+        "efi_certificate_path": None,
+        "efi_certificate_password": None,
         **overrides,
     }
     return Settings(**opts)
@@ -76,3 +80,59 @@ def test_loads_p12_certificate(tmp_path):
     ))
     client = EfiOpenFinanceClient(settings(efi_certificate_path=p12))
     assert client._ssl_context() is not None
+
+
+def test_start_pix_homologation(monkeypatch):
+    api = EfiOpenFinanceClient(settings())
+
+    payload = {
+        "pagador": {"idParticipante": "participante-teste"},
+        "favorecido": {"chave": "chave-teste"},
+        "pagamento": {"valor": "1.00"},
+    }
+
+    chamadas = []
+
+    def fake_request(method, endpoint, body=None):
+        chamadas.append((method, endpoint, body))
+        return {
+            "identificadorPagamento": "urn:efi:teste",
+            "redirectURI": "https://example.com/autorizar",
+        }
+
+    monkeypatch.setattr(api, "_request", fake_request)
+
+    resultado = api.start_pix(payload)
+
+    assert resultado["identificadorPagamento"] == "urn:efi:teste"
+    assert chamadas == [
+        ("POST", "/v1/pagamentos/pix", payload)
+    ]
+
+
+def test_start_pix_blocks_production(monkeypatch):
+    api = EfiOpenFinanceClient(
+        settings(efi_environment="production")
+    )
+
+    def forbidden_request(*args, **kwargs):
+        raise AssertionError("Não deveria acessar a API")
+
+    monkeypatch.setattr(api, "_request", forbidden_request)
+
+    with pytest.raises(
+        EfiConfigurationError,
+        match="bloqueada fora de Homologação",
+    ):
+        api.start_pix({
+            "pagador": {},
+            "favorecido": {},
+            "pagamento": {},
+        })
+
+
+def test_start_pix_requires_payload():
+    api = EfiOpenFinanceClient(settings())
+
+    with pytest.raises(ValueError, match="Payload Pix inválido"):
+        api.start_pix({"pagador": {}})

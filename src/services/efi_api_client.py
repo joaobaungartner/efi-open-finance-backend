@@ -97,6 +97,21 @@ class EfiOpenFinanceClient:
             response.raise_for_status()
             return response.json()
 
+    def start_pix(self, payload: dict) -> dict:
+        """Solicita iniciação Pix exclusivamente em Homologação."""
+        if self.settings.efi_environment != "homologation":
+            raise EfiConfigurationError(
+                "Iniciação Pix bloqueada fora de Homologação"
+            )
+
+        required = ("pagador", "favorecido", "pagamento")
+        if not isinstance(payload, dict) or not all(
+            isinstance(payload.get(field), dict) for field in required
+        ):
+            raise ValueError("Payload Pix inválido")
+
+        return self._request("POST", "/v1/pagamentos/pix", payload)
+
     def get_participants(self) -> dict:
         return self._request("GET", "/v1/participantes")
 
