@@ -12,12 +12,15 @@ services:
       interval: 5s
       retries: 15
   api:
+    command: ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--no-access-log"]
     build: .
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://efi:${POSTGRES_PASSWORD}@db:5432/efi
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - ./secrets/efi-homologacao.p12:/run/secrets/efi-homologacao.p12:ro
     depends_on:
       db:
         condition: service_healthy

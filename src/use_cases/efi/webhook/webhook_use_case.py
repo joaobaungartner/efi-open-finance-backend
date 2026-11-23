@@ -22,6 +22,12 @@ class ReceiveEfiWebhookUseCase:
         if not isinstance(payload, dict):
             raise HTTPException(status_code=422, detail="Payload inválido")
 
+        # Verificação de disponibilidade da Efí.
+        # O HMAC já foi validado acima.
+        # Não cria evento financeiro no banco.
+        if not payload:
+            return {"received": True, "verification": True}
+
         try:
             dto = EfiWebhookDTO.model_validate(payload)
         except ValidationError as exc:
