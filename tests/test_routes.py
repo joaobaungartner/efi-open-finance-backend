@@ -91,3 +91,39 @@ def test_admin_participants_and_redacted_config(client, monkeypatch):
 def test_webhook_oversize(client):
     response = client.post("/webhooks/efi", content=b"x" * 70000)
     assert response.status_code == 413
+
+
+def test_webhook_verificacao_efi(client):
+    from sqlalchemy.orm import Session
+    from models.efi_webhook_event_model import EfiWebhookEventModel
+
+    hmac = get_settings().efi_webhook_hash.get_secret_value()
+    url = "/webhooks/efi"
+
+    # Sem autenticação, a verificação deve falhar.
+    response = client.post(url, json={})
+    assert response.status_code == 401
+
+    # HMAC incorreto também deve ser rejeitado.
+    response = client.post(url, params={"hmac": "incorreto"}, json={})
+    assert response.status_code == 401
+
+    # Verificação autenticada enviada pela Efí.
+    response = client.post(url, params={"hmac": hmac}, json={})
+    assert response.status_code == 200
+    assert response.json() == {
+        "received": True,
+        "verification": True,
+    }
+
+    # Uma notificação financeira incompleta não deve ser aceita.
+    response = client.post(
+        url,
+        params={"hmac": hmac},
+        json={"status": "aceito", "tipo": "pagamento"},
+    )
+    assert response.status_code == 422
+
+    # Nenhum desses testes deve criar um evento financeiro.
+    with Session(engine) as session:
+        assert session.query(EfiWebhookEventModel).count() == 0
