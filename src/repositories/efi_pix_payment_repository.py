@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -93,3 +93,67 @@ class EfiPixPaymentRepository:
                 )
 
             return existing, False
+
+
+    def claim_for_submission(self, key: str) -> bool:
+        """Permite apenas uma transição atômica draft -> submitting.
+
+        True significa que esta operação ganhou o direito de enviar.
+        False significa que já foi reivindicada ou não existe.
+        """
+        result = self.session.execute(
+            update(EfiPixPaymentModel)
+            .where(
+                EfiPixPaymentModel.idempotency_key == key,
+                EfiPixPaymentModel.status == "draft",
+            )
+            .values(status="submitting")
+        )
+        self.session.commit()
+        return result.rowcount == 1
+
+    def mark_awaiting_authorization(
+        self,
+        key: str,
+        *,
+        efi_payment_id: str,
+        redirect_uri: str,
+    ) -> bool:
+        """Registra resposta da Efí; não confirma liquidação Pix."""
+        if not isinstance(efi_payment_id, str) or not 1 <= len(efi_payment_id) <= 300:
+            raise ValueError("Identificador Efí inválido")
+
+        if (
+            not isinstance(redirect_uri, str)
+            or not redirect_uri.startswith("https://")
+            or len(redirect_uri) > 4096
+        ):
+            raise ValueError("URL de autorização inválida")
+
+        result = self.session.execute(
+            update(EfiPixPaymentModel)
+            .where(
+                EfiPixPaymentModel.idempotency_key == key,
+                EfiPixPaymentModel.status == "submitting",
+            )
+            .values(
+                status="awaiting_authorization",
+                efi_payment_id=efi_payment_id,
+                redirect_uri=redirect_uri,
+            )
+        )
+        self.session.commit()
+        return result.rowcount == 1
+
+    def mark_unknown(self, key: str) -> bool:
+        """Marca resultado incerto; nunca autoriza reenvio."""
+        result = self.session.execute(
+            update(EfiPixPaymentModel)
+            .where(
+                EfiPixPaymentModel.idempotency_key == key,
+                EfiPixPaymentModel.status == "submitting",
+            )
+            .values(status="unknown")
+        )
+        self.session.commit()
+        return result.rowcount == 1
