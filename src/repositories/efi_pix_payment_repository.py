@@ -12,6 +12,10 @@ class PixIdempotencyConflict(ValueError):
     pass
 
 
+class InvalidPixAuthorizationResponse(ValueError):
+    """Campos de autorização inválidos antes de qualquer escrita."""
+
+
 class EfiPixPaymentRepository:
     def __init__(self, session: Session):
         self.session = session
@@ -124,14 +128,14 @@ class EfiPixPaymentRepository:
     ) -> bool:
         """Registra resposta da Efí; não confirma liquidação Pix."""
         if not isinstance(efi_payment_id, str) or not 1 <= len(efi_payment_id) <= 300:
-            raise ValueError("Identificador Efí inválido")
+            raise InvalidPixAuthorizationResponse("Identificador Efí inválido")
 
         if (
             not isinstance(redirect_uri, str)
             or not redirect_uri.startswith("https://")
             or len(redirect_uri) > 4096
         ):
-            raise ValueError("URL de autorização inválida")
+            raise InvalidPixAuthorizationResponse("URL de autorização inválida")
 
         result = self.session.execute(
             update(EfiPixPaymentModel)
@@ -148,7 +152,13 @@ class EfiPixPaymentRepository:
         self.session.commit()
         return result.rowcount == 1
 
-    def mark_unknown(self, key: str) -> bool:
+    def mark_unknown(
+        self,
+        key: str,
+        *,
+        efi_http_status: int | None = None,
+        efi_error_code: str | None = None,
+    ) -> bool:
         """Marca resultado incerto; nunca autoriza reenvio."""
         result = self.session.execute(
             update(EfiPixPaymentModel)
@@ -156,7 +166,11 @@ class EfiPixPaymentRepository:
                 EfiPixPaymentModel.idempotency_key == key,
                 EfiPixPaymentModel.status == "submitting",
             )
-            .values(status="unknown")
+            .values(
+                status="unknown",
+                efi_http_status=efi_http_status,
+                efi_error_code=efi_error_code,
+            )
         )
         self.session.commit()
         return result.rowcount == 1

@@ -1,10 +1,15 @@
 from pathlib import Path
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from config.settings import Settings
-from services.efi_api_client import EfiConfigurationError, EfiOpenFinanceClient
+from services.efi_api_client import (
+    EfiConfigurationError,
+    EfiOpenFinanceClient,
+    EfiUnexpectedResponse,
+)
 
 
 def settings(**overrides):
@@ -47,9 +52,21 @@ def test_oauth_token_error_handling():
     fake_client.post.return_value = fake_response
     assert api._token(fake_client) == "example"
     fake_response.json.return_value = {}
-    with pytest.raises(EfiConfigurationError):
+    with pytest.raises(EfiUnexpectedResponse):
         api._token(fake_client)
 
+
+@pytest.mark.parametrize("content", [b"<html>", b"[]", b"null"])
+def test_efi_rejects_non_object_response(content):
+    response = httpx.Response(
+        200, content=content, request=httpx.Request("POST", "https://efi.test")
+    )
+
+    with pytest.raises(EfiUnexpectedResponse) as error:
+        EfiOpenFinanceClient._json_object(response)
+
+    assert error.value.status_code == 200
+    assert content.decode() not in str(error.value)
 
 
 def test_loads_p12_certificate(tmp_path):

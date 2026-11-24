@@ -15,11 +15,14 @@ class EfiConfigurationError(RuntimeError):
     pass
 
 
-class EfiOpenFinanceClient:
-    """Cliente somente para autenticação, leitura e configuração da API Efí.
+class EfiUnexpectedResponse(httpx.HTTPError):
+    def __init__(self, status_code: int):
+        super().__init__("Resposta Efí inesperada")
+        self.status_code = status_code
 
-    Deliberadamente não oferece POST /pagamentos/pix nesta versão.
-    """
+
+class EfiOpenFinanceClient:
+    """Cliente Efí com mTLS e iniciação Pix restrita à homologação."""
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
@@ -77,11 +80,21 @@ class EfiOpenFinanceClient:
             auth=httpx.BasicAuth(user, secret),
             json={"grant_type": "client_credentials"},
         )
-        response.raise_for_status()
-        token = response.json().get("access_token")
+        token = self._json_object(response).get("access_token")
         if not isinstance(token, str) or not token:
-            raise EfiConfigurationError("Efí não retornou access_token")
+            raise EfiUnexpectedResponse(response.status_code)
         return token
+
+    @staticmethod
+    def _json_object(response: httpx.Response) -> dict:
+        response.raise_for_status()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise EfiUnexpectedResponse(response.status_code) from exc
+        if not isinstance(data, dict):
+            raise EfiUnexpectedResponse(response.status_code)
+        return data
 
     def _request(
         self,
@@ -92,9 +105,14 @@ class EfiOpenFinanceClient:
         idempotency_key: str | None = None,
         params: dict | None = None,
     ) -> dict:
+        try:
+            ssl_context = self._ssl_context()
+        except OSError as exc:
+            raise EfiConfigurationError("Falha ao carregar certificado Efí") from exc
+
         with httpx.Client(
             base_url=self.settings.efi_api_base,
-            verify=self._ssl_context(),
+            verify=ssl_context,
             timeout=20,
         ) as client:
             token = self._token(client)
@@ -113,8 +131,7 @@ class EfiOpenFinanceClient:
                 json=body,
                 params=params,
             )
-            response.raise_for_status()
-            return response.json()
+            return self._json_object(response)
 
     def start_pix(self, payload: dict, *, idempotency_key: str) -> dict:
         """Solicita Pix com idempotência exclusivamente em Homologação."""

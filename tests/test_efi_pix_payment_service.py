@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from database.database import Base
@@ -11,7 +12,7 @@ from repositories.efi_pix_payment_repository import (
     EfiPixPaymentRepository,
     PixIdempotencyConflict,
 )
-from services.efi_api_client import EfiConfigurationError
+from services.efi_api_client import EfiConfigurationError, EfiUnexpectedResponse
 from services.efi_pix_payment_service import EfiPixPaymentService
 
 
@@ -122,6 +123,7 @@ def test_resposta_incompleta(setup_service):
     result = enviar(service)
 
     assert result["status"] == "unknown"
+    assert repo.get_by_idempotency_key("pix-001").efi_error_code == "efi_invalid_response"
     assert len(client.calls) == 1
 
 
@@ -140,6 +142,113 @@ def test_falha_ao_gravar_retorno(setup_service, monkeypatch):
 
     assert first["status"] == "unknown"
     assert second["status"] == "unknown"
+    payment = repo.get_by_idempotency_key("pix-001")
+    assert payment.efi_http_status is None
+    assert payment.efi_error_code == "local_persistence_error"
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (400, "efi_http_400"),
+        (401, "efi_http_401"),
+        (403, "efi_http_403"),
+        (422, "efi_http_422"),
+        (429, "efi_rate_limited"),
+        (500, "efi_server_error"),
+        (503, "efi_server_error"),
+        (307, "efi_http_unexpected"),
+    ],
+)
+def test_erros_http_geram_diagnostico_sem_reenvio(setup_service, status, code):
+    service, repo, client = setup_service
+    request = httpx.Request("POST", "https://efi.test/v1/pagamentos/pix")
+    response = httpx.Response(
+        status,
+        request=request,
+        json={"codigo": "codigo-remoto", "mensagem": "dado-sensivel-ficticio"},
+    )
+    client.error = httpx.HTTPStatusError("mensagem sensível", request=request, response=response)
+
+    assert enviar(service)["status"] == "unknown"
+    assert enviar(service)["status"] == "unknown"
+    payment = repo.get_by_idempotency_key("pix-001")
+    assert payment.efi_http_status == status
+    assert payment.efi_error_code == code
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "code"),
+    [
+        (httpx.ReadTimeout("detalhe fictício"), None, "efi_timeout"),
+        (httpx.ConnectTimeout("detalhe fictício"), None, "efi_timeout"),
+        (httpx.ConnectError("detalhe fictício"), None, "efi_transport_error"),
+        (httpx.ReadError("detalhe fictício"), None, "efi_transport_error"),
+        (httpx.DecodingError("detalhe fictício"), None, "efi_invalid_response"),
+        (EfiUnexpectedResponse(200), 200, "efi_invalid_response"),
+        (EfiConfigurationError("configuração fictícia"), None, "local_configuration_error"),
+        (ValueError("entrada fictícia"), None, "local_validation_error"),
+        (RuntimeError("falha fictícia"), None, "submission_unexpected_error"),
+    ],
+)
+def test_falhas_no_cliente_geram_diagnostico_sem_reenvio(setup_service, error, status, code):
+    service, repo, client = setup_service
+    client.error = error
+
+    assert enviar(service)["status"] == "unknown"
+    assert enviar(service)["status"] == "unknown"
+    payment = repo.get_by_idempotency_key("pix-001")
+    assert payment.efi_http_status == status
+    assert payment.efi_error_code == code
+    assert len(client.calls) == 1
+
+
+def test_conflito_ao_gravar_resposta_valida(setup_service):
+    service, repo, client = setup_service
+    assert enviar(service)["status"] == "awaiting_authorization"
+
+    # O segundo POST simulado devolve um identificador já armazenado.
+    assert enviar(service, key="pix-002")["status"] == "unknown"
+    assert enviar(service, key="pix-002")["status"] == "unknown"
+    payment = repo.get_by_idempotency_key("pix-002")
+    assert payment.efi_payment_id is None
+    assert payment.efi_http_status is None
+    assert payment.efi_error_code == "local_persistence_error"
+    assert len(client.calls) == 2
+
+
+def test_commit_concluido_com_resposta_incerta_preserva_autorizacao(setup_service, monkeypatch):
+    service, repo, client = setup_service
+    store = repo.mark_awaiting_authorization
+
+    def commit_then_fail(*args, **kwargs):
+        assert store(*args, **kwargs)
+        raise OperationalError("UPDATE", None, RuntimeError("conexão interrompida"))
+
+    monkeypatch.setattr(repo, "mark_awaiting_authorization", commit_then_fail)
+
+    assert enviar(service)["status"] == "awaiting_authorization"
+    assert enviar(service)["status"] == "awaiting_authorization"
+    assert repo.get_by_idempotency_key("pix-001").efi_error_code is None
+    assert len(client.calls) == 1
+
+
+def test_banco_indisponivel_para_diagnostico_preserva_submitting(setup_service, monkeypatch):
+    service, repo, client = setup_service
+
+    def fail(*args, **kwargs):
+        raise OperationalError("UPDATE", None, RuntimeError("conexão interrompida"))
+
+    monkeypatch.setattr(repo, "mark_awaiting_authorization", fail)
+    monkeypatch.setattr(repo, "mark_unknown", fail)
+
+    with pytest.raises(OperationalError):
+        enviar(service)
+
+    assert enviar(service)["status"] == "submitting"
+    assert repo.get_by_idempotency_key("pix-001").efi_http_status is None
     assert len(client.calls) == 1
 
 
