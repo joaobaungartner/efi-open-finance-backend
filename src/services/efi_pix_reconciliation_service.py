@@ -1,6 +1,7 @@
 from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qs, urlsplit
 
+from models.efi_pix_payment_model import EfiPixPaymentModel
 from repositories.efi_pix_payment_repository import EfiPixPaymentRepository
 from services.efi_api_client import EfiConfigurationError, EfiOpenFinanceClient
 
@@ -9,8 +10,11 @@ class PixReconciliationError(RuntimeError):
     """Resposta incompleta ou insegura para conciliação."""
 
 
+INVESTIGABLE_STATUSES = frozenset({"submitting", "unknown"})
+
+
 class EfiPixReconciliationService:
-    """Diagnóstico somente de leitura para pagamentos unknown."""
+    """Diagnóstico somente de leitura para solicitações de resultado incerto."""
 
     def __init__(
         self,
@@ -37,12 +41,6 @@ class EfiPixReconciliationService:
         if not isinstance(idempotency_key, str) or not idempotency_key:
             raise ValueError("Chave de idempotência inválida")
 
-        if type(quantidade) is not int or not 1 <= quantidade <= 100:
-            raise ValueError("Quantidade inválida")
-
-        if type(max_paginas) is not int or not 1 <= max_paginas <= 50:
-            raise ValueError("Limite de páginas inválido")
-
         payment = self.repository.get_by_idempotency_key(
             idempotency_key
         )
@@ -54,6 +52,28 @@ class EfiPixReconciliationService:
             raise ValueError(
                 "Somente pagamentos unknown podem ser inspecionados"
             )
+
+        return self.inspect_payment(
+            payment, inicio=inicio, fim=fim, quantidade=quantidade, max_paginas=max_paginas
+        )
+
+    def inspect_payment(
+        self,
+        payment: EfiPixPaymentModel,
+        *,
+        inicio: str,
+        fim: str,
+        quantidade: int = 100,
+        max_paginas: int = 20,
+    ) -> dict:
+        if self.client.settings.efi_environment != "homologation":
+            raise EfiConfigurationError("Reconciliação limitada à Homologação")
+        if payment.status not in INVESTIGABLE_STATUSES:
+            raise ValueError("Somente pagamentos submitting ou unknown podem ser inspecionados")
+        if type(quantidade) is not int or not 1 <= quantidade <= 100:
+            raise ValueError("Quantidade inválida")
+        if type(max_paginas) is not int or not 1 <= max_paginas <= 50:
+            raise ValueError("Limite de páginas inválido")
 
         if not payment.id_proprio:
             raise PixReconciliationError(
@@ -101,7 +121,10 @@ class EfiPixReconciliationService:
                 if type(total) is int and total >= 0:
                     pass
                 elif isinstance(total, str) and total.isdecimal():
-                    total = int(total)
+                    try:
+                        total = int(total)
+                    except ValueError as exc:
+                        raise PixReconciliationError("Total de pagamentos inválido") from exc
                 else:
                     raise PixReconciliationError(
                         "Total de pagamentos inválido"
@@ -131,7 +154,10 @@ class EfiPixReconciliationService:
                     "Paginação Efí inválida"
                 )
 
-            url = urlsplit(next_link)
+            try:
+                url = urlsplit(next_link)
+            except ValueError as exc:
+                raise PixReconciliationError("Link de paginação inválido") from exc
 
             if (
                 url.scheme

@@ -2,6 +2,8 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+from decimal import Decimal
 from hashlib import sha512
 from pathlib import Path
 from threading import Barrier, Lock
@@ -12,17 +14,20 @@ import httpx
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import URL, create_engine, select, text
+from fastapi import Response
+from sqlalchemy import URL, create_engine, inspect, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from commit_proxy import commit_proxy
 from config.settings import Settings
 from database import database
+from models.efi_pix_investigation_model import EfiPixInvestigationModel
 from models.efi_pix_payment_model import EfiPixPaymentModel
 from repositories.efi_pix_payment_repository import EfiPixPaymentRepository, PixIdempotencyConflict
 from services.efi_api_client import EfiOpenFinanceClient
 from services.efi_pix_payment_service import EfiPixPaymentService
+from use_cases.efi.pix_read.index import inspecionar_pagamento
 
 HOST = "pix-postgres"
 http_client = httpx.Client
@@ -64,7 +69,20 @@ def postgres():
                     raise
                 time.sleep(0.5)
         with patch.object(database, "engine", engine):
-            command.upgrade(Config("alembic.ini"), "head")
+            config = Config("alembic.ini")
+            command.upgrade(config, "0004_pix_error_diagnostics")
+            with Session(engine) as session:
+                EfiPixPaymentRepository(session).reserve(
+                    idempotency_key="antes-da-migracao",
+                    request_hash="a" * 64,
+                    amount=Decimal("10.00"),
+                    origin_institution="teste",
+                )
+            command.upgrade(config, "head")
+            command.check(config)
+            command.downgrade(config, "0004_pix_error_diagnostics")
+            assert not inspect(engine).has_table("efi_pix_investigations")
+            command.upgrade(config, "head")
         yield engine
     finally:
         engine.dispose()
@@ -259,3 +277,69 @@ def test_separacao_oauth_e_pix(postgres, monkeypatch, oauth):
     assert stored.efi_payment_id is stored.redirect_uri is None
     assert stored.efi_error_code == ("efi_oauth_http_401" if oauth else "efi_http_401")
     assert calls == (["/v1/oauth/token"] if oauth else ["/v1/oauth/token", "/v1/pagamentos/pix"])
+
+
+def test_migracao_preserva_pagamento_preexistente(postgres):
+    [stored] = records(postgres, "antes-da-migracao")
+    assert stored.status == "draft"
+    assert stored.amount == Decimal("10.00")
+    assert stored.request_hash == "a" * 64
+    assert stored.id_proprio
+    with Session(postgres) as session:
+        assert session.scalar(
+            select(EfiPixInvestigationModel.id).where(
+                EfiPixInvestigationModel.payment_id == stored.id
+            )
+        ) is None
+
+
+def test_investigacoes_concorrentes_preservam_pagamento(postgres, monkeypatch):
+    key = "auditoria-concorrente"
+    with Session(postgres) as session:
+        repo = EfiPixPaymentRepository(session)
+        payment, _ = repo.reserve(
+            idempotency_key=key,
+            request_hash="a" * 64,
+            amount=Decimal("10.00"),
+            origin_institution="teste",
+        )
+        payment_id = payment.id
+        assert repo.claim_for_submission(key)
+    [before] = records(postgres, key)
+    barrier = Barrier(2, timeout=10)
+
+    def list_payments(*args, **kwargs):
+        barrier.wait()
+        return {"pagamentos": [], "total": 0, "proximo": None}
+
+    monkeypatch.setattr(EfiOpenFinanceClient, "list_pix_payments", list_payments)
+
+    def investigate():
+        with Session(postgres) as session:
+            return inspecionar_pagamento(
+                Response(),
+                payment_id=payment_id,
+                inicio=date(2026, 11, 1),
+                fim=date(2026, 11, 24),
+                quantidade=50,
+                max_paginas=20,
+                db=session,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(investigate)
+        second = executor.submit(investigate)
+        ids = {first.result(timeout=20)["investigacao_id"], second.result(timeout=20)["investigacao_id"]}
+
+    with Session(postgres) as session:
+        entries = session.scalars(
+            select(EfiPixInvestigationModel).where(EfiPixInvestigationModel.payment_id == payment_id)
+        ).all()
+        assert len(entries) == 2
+        assert {entry.id for entry in entries} == ids
+        assert all(entry.result == "nao_encontrado_no_periodo" for entry in entries)
+        assert all(entry.observed_status == "submitting" and entry.finished_at for entry in entries)
+    [after] = records(postgres, key)
+    assert after.status == before.status == "submitting"
+    assert after.updated_at == before.updated_at
+    assert after.efi_payment_id is None

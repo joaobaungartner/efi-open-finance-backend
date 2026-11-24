@@ -1,6 +1,10 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import event, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
 
 from app import app
 from config.settings import get_settings
@@ -202,7 +206,7 @@ def test_pix_listagem_filtro_paginacao(client):
     assert "redirect_uri" not in data["pagamentos"][0]
 
 
-def test_pix_inspecao_unknown_nao_escreve(client, monkeypatch):
+def test_pix_inspecao_unknown_preserva_pagamento(client, monkeypatch):
     from services.efi_api_client import EfiOpenFinanceClient
     from models.efi_pix_payment_model import EfiPixPaymentModel
     from sqlalchemy.orm import Session
@@ -262,12 +266,20 @@ def test_pix_inspecao_unknown_nao_escreve(client, monkeypatch):
         == "correspondencia_consistente"
     )
     assert chamadas == [1]
+    assert response.headers["Cache-Control"] == "no-store"
 
     with Session(engine) as db:
         payment = db.get(EfiPixPaymentModel, payment_id)
 
         assert payment.status == "unknown"
         assert payment.efi_payment_id is None
+
+    historico = client.get(
+        f"/internal/efi/pix/pagamentos/{payment_id}/investigacoes",
+        headers=_admin_headers(),
+    ).json()
+    assert historico["total"] == 1
+    assert historico["investigacoes"][0]["resultado"] == "correspondencia_consistente"
 
 
 def test_pix_inspecao_rejeita_estado_diferente(client, monkeypatch):
@@ -326,6 +338,14 @@ def test_pix_inspecao_mascara_falha_externa(client, monkeypatch):
 
     assert response.status_code == 502
     assert "detalhe_bancario_privado" not in response.text
+    historico = client.get(
+        f"/internal/efi/pix/pagamentos/{payment_id}/investigacoes",
+        headers=_admin_headers(),
+    )
+    assert "detalhe_bancario_privado" not in historico.text
+    [entry] = historico.json()["investigacoes"]
+    assert entry["resultado"] == "falha_comunicacao_efi"
+    assert entry["finalizada_em"]
 
 
 def test_pix_parametros_invalidos(client):
@@ -341,11 +361,195 @@ def test_pix_parametros_invalidos(client):
 
     response = client.get(
         "/internal/efi/pix/pagamentos/1/reconciliacao",
-        params={
-            "inicio": "2026-11-24",
-            "fim": "2026-11-01",
-        },
+        params={"inicio": "2026-11-24", "fim": "2026-11-01"},
         headers=_admin_headers(),
     )
-
     assert response.status_code == 422
+
+
+def test_pix_pendentes_filtram_updated_at_e_status(client):
+    from models.efi_pix_payment_model import EfiPixPaymentModel
+
+    now = datetime.now(UTC)
+    with Session(engine) as db:
+        for index, status in enumerate(("draft", "submitting", "unknown", "awaiting_authorization")):
+            db.add(
+                EfiPixPaymentModel(
+                    idempotency_key=f"privada-{status}",
+                    request_hash="a" * 64,
+                    amount=10,
+                    origin_institution="privado",
+                    redirect_uri="https://privado.example/autorizar",
+                    status=status,
+                    created_at=now - timedelta(days=1),
+                    updated_at=now - timedelta(minutes=61 - index),
+                )
+            )
+        db.add(
+            EfiPixPaymentModel(
+                idempotency_key="privada-recente",
+                request_hash="b" * 64,
+                amount=10,
+                origin_institution="privado",
+                status="unknown",
+                created_at=now - timedelta(days=1),
+                updated_at=now,
+            )
+        )
+        db.commit()
+
+    url = "/internal/efi/pix/pagamentos/pendentes"
+    assert client.get(url).status_code == 401
+    response = client.get(url, params={"quantidade": 2}, headers=_admin_headers())
+    assert response.status_code == 200
+    assert response.json()["total"] == 4
+    assert [p["status"] for p in response.json()["pagamentos"]] == ["draft", "submitting"]
+    assert "privad" not in response.text
+
+    response = client.get(url, params={"pagina": 2, "quantidade": 2}, headers=_admin_headers())
+    unknown, awaiting = response.json()["pagamentos"]
+    assert unknown["status"] == "unknown"
+    assert awaiting["status"] == "awaiting_authorization"
+    assert "sem confirmação de liquidação" in awaiting["descricao"]
+    assert awaiting["updated_at"].endswith("+00:00")
+
+    response = client.get(
+        url, params={"status": "unknown", "idade_minima_minutos": 0}, headers=_admin_headers()
+    )
+    assert response.json()["total"] == 2
+    response = client.get(url, params={"idade_minima_minutos": 120}, headers=_admin_headers())
+    assert response.json()["total"] == 0
+    assert client.get(
+        url, params={"idade_minima_minutos": -1}, headers=_admin_headers()
+    ).status_code == 422
+
+
+def test_pix_investiga_submitting_audita_ambiguidade_e_ausencia(client, monkeypatch):
+    from models.efi_pix_investigation_model import EfiPixInvestigationModel
+    from models.efi_pix_payment_model import EfiPixPaymentModel
+    from repositories.efi_pix_payment_repository import EfiPixPaymentRepository
+    from services.efi_api_client import EfiOpenFinanceClient
+
+    key = "chave-local-privada"
+    payment_id, id_proprio = _criar_pix_para_rota(key)
+    with Session(engine) as db:
+        assert EfiPixPaymentRepository(db).claim_for_submission(key)
+        original_updated_at = db.get(EfiPixPaymentModel, payment_id).updated_at
+
+    def nao_enviar(*args, **kwargs):
+        pytest.fail("Uma investigação não deve iniciar Pix")
+
+    calls = []
+
+    def consulta(*args, **kwargs):
+        with Session(engine) as db:
+            entry = db.scalar(
+                select(EfiPixInvestigationModel)
+                .order_by(EfiPixInvestigationModel.id.desc())
+                .limit(1)
+            )
+            assert entry.result == "iniciada"
+            assert entry.observed_status == "submitting"
+            assert entry.finished_at is None
+        calls.append(kwargs["pagina"])
+        match = {
+            "idProprio": id_proprio,
+            "identificadorPagamento": "identificador-externo-privado",
+            "status": "estado-externo-privado",
+            "valor": "10.00",
+        }
+        if len(calls) == 1:
+            return {"pagamentos": [match, match], "total": 2, "proximo": None}
+        return {"pagamentos": [], "total": 0, "proximo": None}
+
+    monkeypatch.setattr(EfiOpenFinanceClient, "start_pix", nao_enviar)
+    monkeypatch.setattr(EfiOpenFinanceClient, "list_pix_payments", consulta)
+    base = f"/internal/efi/pix/pagamentos/{payment_id}"
+    params = {"inicio": "2026-11-01", "fim": "2026-11-24"}
+    assert client.post(f"{base}/reconciliacao", params=params).status_code == 401
+    assert client.get(f"{base}/investigacoes").status_code == 401
+    assert calls == []
+
+    for expected in ("ambiguo", "nao_encontrado_no_periodo"):
+        response = client.post(f"{base}/reconciliacao", params=params, headers=_admin_headers())
+        assert response.status_code == 200
+        assert response.json()["diagnostico"] == expected
+        assert response.json()["local_status"] == "submitting"
+        assert "privad" not in response.text
+
+    response = client.get(f"{base}/investigacoes", headers=_admin_headers(), params={"quantidade": 1})
+    assert response.status_code == 200
+    assert response.json()["total"] == 2
+    [entry] = response.json()["investigacoes"]
+    assert entry["resultado"] == "nao_encontrado_no_periodo"
+    assert entry["estado_observado"] == "submitting"
+    assert entry["payment_id"] == payment_id
+    assert entry["origem"] == "api_admin"
+    assert entry["inicio"] == params["inicio"]
+    assert entry["fim"] == params["fim"]
+    assert entry["iniciada_em"] <= entry["finalizada_em"]
+    assert "privad" not in response.text
+    assert calls == [1, 1]
+    with Session(engine) as db:
+        payment = db.get(EfiPixPaymentModel, payment_id)
+        assert payment.status == "submitting"
+        assert payment.updated_at == original_updated_at
+        assert payment.efi_payment_id is None
+
+
+def test_pix_investigacao_inexistente_retorna_404(client):
+    base = "/internal/efi/pix/pagamentos/999"
+    assert client.post(
+        f"{base}/reconciliacao",
+        params={"inicio": "2026-11-01", "fim": "2026-11-24"},
+        headers=_admin_headers(),
+    ).status_code == 404
+    assert client.get(f"{base}/investigacoes", headers=_admin_headers()).status_code == 404
+
+
+@pytest.mark.parametrize("falha_finalizacao", [False, True])
+def test_pix_falha_ao_gravar_auditoria_preserva_pagamento(client, monkeypatch, falha_finalizacao):
+    from models.efi_pix_investigation_model import EfiPixInvestigationModel
+    from models.efi_pix_payment_model import EfiPixPaymentModel
+    from services.efi_api_client import EfiOpenFinanceClient
+
+    payment_id, _ = _criar_pix_para_rota("falha-auditoria", unknown=True)
+    with Session(engine) as db:
+        updated_at = db.get(EfiPixPaymentModel, payment_id).updated_at
+    calls = []
+
+    def consulta(*args, **kwargs):
+        calls.append(kwargs["pagina"])
+        return {"pagamentos": [], "total": 0, "proximo": None}
+
+    def falhar_no_commit(session):
+        for entry in session.identity_map.values():
+            if isinstance(entry, EfiPixInvestigationModel) and (
+                (entry.finished_at is not None) == falha_finalizacao
+            ):
+                raise SQLAlchemyError("falha fictícia na auditoria")
+
+    monkeypatch.setattr(EfiOpenFinanceClient, "list_pix_payments", consulta)
+    event.listen(Session, "before_commit", falhar_no_commit)
+    try:
+        with pytest.raises(SQLAlchemyError, match="falha fictícia na auditoria"):
+            client.post(
+                f"/internal/efi/pix/pagamentos/{payment_id}/reconciliacao",
+                params={"inicio": "2026-11-01", "fim": "2026-11-24"},
+                headers=_admin_headers(),
+            )
+    finally:
+        event.remove(Session, "before_commit", falhar_no_commit)
+
+    assert calls == ([1] if falha_finalizacao else [])
+    with Session(engine) as db:
+        entries = db.scalars(select(EfiPixInvestigationModel)).all()
+        if falha_finalizacao:
+            [entry] = entries
+            assert entry.result == "iniciada"
+            assert entry.finished_at is None
+        else:
+            assert entries == []
+        payment = db.get(EfiPixPaymentModel, payment_id)
+        assert payment.status == "unknown"
+        assert payment.updated_at == updated_at
