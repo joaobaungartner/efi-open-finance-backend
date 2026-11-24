@@ -6,13 +6,14 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from config.settings import Settings
 from database.database import Base
 from models.efi_pix_payment_model import EfiPixPaymentModel
 from repositories.efi_pix_payment_repository import (
     EfiPixPaymentRepository,
     PixIdempotencyConflict,
 )
-from services.efi_api_client import EfiConfigurationError, EfiUnexpectedResponse
+from services.efi_api_client import EfiConfigurationError, EfiOpenFinanceClient, EfiUnexpectedResponse
 from services.efi_pix_payment_service import EfiPixPaymentService
 
 
@@ -127,6 +128,19 @@ def test_resposta_incompleta(setup_service):
     assert len(client.calls) == 1
 
 
+def test_url_invalida_mantem_unknown_sem_reenvio(setup_service):
+    service, repo, client = setup_service
+    client.response["redirectURI"] = "https://"
+
+    assert enviar(service)["status"] == "unknown"
+    assert enviar(service)["status"] == "unknown"
+    payment = repo.get_by_idempotency_key("pix-001")
+    assert payment.redirect_uri is None
+    assert payment.efi_payment_id is None
+    assert payment.efi_error_code == "efi_invalid_response"
+    assert len(client.calls) == 1
+
+
 def test_falha_ao_gravar_retorno(setup_service, monkeypatch):
     service, repo, client = setup_service
 
@@ -177,6 +191,66 @@ def test_erros_http_geram_diagnostico_sem_reenvio(setup_service, status, code):
     assert payment.efi_http_status == status
     assert payment.efi_error_code == code
     assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("oauth_failure", [True, False], ids=["oauth", "post-pix"])
+@pytest.mark.parametrize(
+    ("failure", "status", "code"),
+    [
+        (400, 400, "http_400"),
+        (401, 401, "http_401"),
+        (403, 403, "http_403"),
+        (429, 429, "rate_limited"),
+        (500, 500, "server_error"),
+        ("invalid", 200, "invalid_response"),
+        ("timeout", None, "timeout"),
+        ("connection", None, "transport_error"),
+    ],
+)
+def test_diagnostico_por_etapa_http(
+    setup_service, monkeypatch, oauth_failure, failure, status, code
+):
+    service, repo, _ = setup_service
+    calls = []
+    oauth_path = "/v1/oauth/token"
+    pix_path = "/v1/pagamentos/pix"
+
+    def respond(request):
+        calls.append(request.url.path)
+        if request.url.path == oauth_path and not oauth_failure:
+            assert "x-idempotency-key" not in request.headers
+            return httpx.Response(200, json={"access_token": "token-ficticio"})
+        if request.url.path == pix_path:
+            assert len(request.headers["x-idempotency-key"]) == 72
+        if failure == "invalid":
+            return httpx.Response(200, content=b"resposta-invalida-ficticia")
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timeout simulado", request=request)
+        if failure == "connection":
+            raise httpx.ConnectError("conexao simulada", request=request)
+        return httpx.Response(failure, json={"mensagem": "dado-ficticio"})
+
+    settings = Settings(
+        _env_file=None,
+        efi_client_id="cliente-ficticio",
+        efi_client_secret="segredo-ficticio",
+    )
+    service.client = EfiOpenFinanceClient(settings)
+    monkeypatch.setattr(service.client, "_ssl_context", lambda: True)
+    client_type = httpx.Client
+    monkeypatch.setattr(
+        "services.efi_api_client.httpx.Client",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(respond), **kwargs),
+    )
+
+    assert enviar(service)["status"] == "unknown"
+    assert enviar(service)["status"] == "unknown"
+    payment = repo.get_by_idempotency_key("pix-001")
+    assert payment.efi_http_status == status
+    assert payment.efi_error_code == f"{'efi_oauth' if oauth_failure else 'efi'}_{code}"
+    assert payment.efi_payment_id is None
+    assert payment.redirect_uri is None
+    assert calls == ([oauth_path] if oauth_failure else [oauth_path, pix_path])
 
 
 @pytest.mark.parametrize(

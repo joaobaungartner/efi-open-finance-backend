@@ -90,21 +90,30 @@ def test_claim_for_submission_somente_uma_vez(repo):
     assert payment.status == "submitting"
 
 
-def test_resposta_efi_aguarda_autorizacao(repo):
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/autorizar",
+        "https://Open-Finance.example:443/authorize?state=a%20b&return=https%3A%2F%2Fexample.com",
+        "https://192.0.2.42/authorize",
+        "https://[2001:db8::42]:443/authorize",
+    ],
+)
+def test_resposta_efi_aguarda_autorizacao(repo, url):
     reservar(repo)
     assert repo.claim_for_submission("pix-001") is True
 
     assert repo.mark_awaiting_authorization(
         "pix-001",
         efi_payment_id="urn:efi:teste-123",
-        redirect_uri="https://example.com/autorizar",
+        redirect_uri=url,
     ) is True
 
     payment = repo.get_by_idempotency_key("pix-001")
 
     assert payment.status == "awaiting_authorization"
     assert payment.efi_payment_id == "urn:efi:teste-123"
-    assert payment.redirect_uri == "https://example.com/autorizar"
+    assert payment.redirect_uri == url
 
     # Mesmo após receber a resposta, não permite um novo envio.
     assert repo.claim_for_submission("pix-001") is False
@@ -123,7 +132,32 @@ def test_timeout_bloqueia_reenvio(repo):
     assert repo.mark_unknown("pix-001") is False
 
 
-def test_nao_aceita_redirect_inseguro(repo):
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com/autorizar",
+        "https://",
+        "https:///autorizar",
+        "https://:443/autorizar",
+        "https://usuario:senha@example.com/autorizar",
+        "https://@example.com/autorizar",
+        "https://example.com\\@outro.example/autorizar",
+        " https://example.com/autorizar",
+        "https://exa\tmple.com/autorizar",
+        "https://example.com/a b",
+        "https://example.com/a\x7f",
+        "https://example.com/a%0A",
+        "https://example.com/a%Q1",
+        "https://example..com/autorizar",
+        "https://-example.com/autorizar",
+        "https://example.com:65536/autorizar",
+        "https://example.com:/autorizar",
+        "https://[2001:db8::42/autorizar",
+        "https://[2001:db8::42]malformado/autorizar",
+        "https://0x7f000001/autorizar",
+    ],
+)
+def test_nao_aceita_redirect_inseguro(repo, url):
     reservar(repo)
     repo.claim_for_submission("pix-001")
 
@@ -131,11 +165,12 @@ def test_nao_aceita_redirect_inseguro(repo):
         repo.mark_awaiting_authorization(
             "pix-001",
             efi_payment_id="urn:efi:teste",
-            redirect_uri="http://example.com/autorizar",
+            redirect_uri=url,
         )
 
     payment = repo.get_by_idempotency_key("pix-001")
     assert payment.status == "submitting"
+    assert payment.redirect_uri is None
 
 
 def test_unknown_nao_vira_autorizacao_automaticamente(repo):

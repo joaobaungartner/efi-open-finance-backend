@@ -1,4 +1,7 @@
+import re
 from decimal import Decimal
+from ipaddress import IPv4Address, IPv6Address
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from sqlalchemy import select, update
@@ -14,6 +17,45 @@ class PixIdempotencyConflict(ValueError):
 
 class InvalidPixAuthorizationResponse(ValueError):
     """Campos de autorização inválidos antes de qualquer escrita."""
+
+
+def _valid_authorization_url(value: str) -> bool:
+    if not isinstance(value, str) or len(value) > 4096:
+        return False
+    # Reject characters urlsplit or a browser can strip or reinterpret.
+    if not re.fullmatch(r"[A-Za-z0-9:/?#\[\]@!$&'()*+,;=._~%-]+", value):
+        return False
+    if re.search(r"%(?![0-9A-Fa-f]{2})|%(?:0[0-9A-Fa-f]|1[0-9A-Fa-f]|7[fF])", value):
+        return False
+
+    try:
+        url = urlsplit(value)
+        host = url.hostname
+        port = url.port
+        if url.scheme != "https" or not host or "@" in url.netloc:
+            return False
+        if url.netloc.endswith(":") or port == 0:
+            return False
+        if url.netloc.startswith("["):
+            suffix = url.netloc.partition("]")[2]
+            if "%" in host or (suffix and not (suffix.startswith(":") and port is not None)):
+                return False
+            IPv6Address(host)
+            return True
+        if ":" in host:
+            return False
+        dns_name = host.removesuffix(".")
+        labels = dns_name.split(".")
+        if re.fullmatch(r"[0-9]+|0x[0-9a-f]*", labels[-1]):
+            # Browsers treat numeric suffixes as IPv4, including legacy forms.
+            return str(IPv4Address(dns_name)) == dns_name
+    except ValueError:
+        return False
+
+    return len(dns_name) <= 253 and all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in labels
+    )
 
 
 class EfiPixPaymentRepository:
@@ -130,11 +172,7 @@ class EfiPixPaymentRepository:
         if not isinstance(efi_payment_id, str) or not 1 <= len(efi_payment_id) <= 300:
             raise InvalidPixAuthorizationResponse("Identificador Efí inválido")
 
-        if (
-            not isinstance(redirect_uri, str)
-            or not redirect_uri.startswith("https://")
-            or len(redirect_uri) > 4096
-        ):
+        if not _valid_authorization_url(redirect_uri):
             raise InvalidPixAuthorizationResponse("URL de autorização inválida")
 
         result = self.session.execute(

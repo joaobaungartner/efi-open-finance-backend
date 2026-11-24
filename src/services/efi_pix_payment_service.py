@@ -12,6 +12,7 @@ from repositories.efi_pix_payment_repository import (
 )
 from services.efi_api_client import (
     EfiConfigurationError,
+    EfiOAuthError,
     EfiOpenFinanceClient,
     EfiUnexpectedResponse,
 )
@@ -25,6 +26,21 @@ def _http_error_code(status: int) -> str:
     if 500 <= status <= 599:
         return "efi_server_error"
     return "efi_http_unexpected"
+
+
+def _http_diagnostic(error: httpx.HTTPError) -> tuple[int | None, str]:
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        return status, _http_error_code(status)
+    if isinstance(error, EfiUnexpectedResponse):
+        return error.status_code, "efi_invalid_response"
+    if isinstance(error, httpx.TimeoutException):
+        return None, "efi_timeout"
+    if isinstance(error, httpx.TransportError):
+        return None, "efi_transport_error"
+    if isinstance(error, httpx.DecodingError):
+        return None, "efi_invalid_response"
+    return None, "submission_unexpected_error"
 
 
 class EfiPixPaymentService:
@@ -138,18 +154,11 @@ class EfiPixPaymentService:
                 idempotency_key=bank_key,
             )
 
-        except httpx.HTTPStatusError as exc:
-            http_status = exc.response.status_code
-            error_code = _http_error_code(http_status)
-        except EfiUnexpectedResponse as exc:
-            http_status = exc.status_code
-            error_code = "efi_invalid_response"
-        except httpx.TimeoutException:
-            error_code = "efi_timeout"
-        except httpx.TransportError:
-            error_code = "efi_transport_error"
-        except httpx.DecodingError:
-            error_code = "efi_invalid_response"
+        except EfiOAuthError as exc:
+            http_status, code = _http_diagnostic(exc.error)
+            error_code = f"efi_oauth_{code.removeprefix('efi_')}"
+        except httpx.HTTPError as exc:
+            http_status, error_code = _http_diagnostic(exc)
         except EfiConfigurationError:
             error_code = "local_configuration_error"
         except ValueError:

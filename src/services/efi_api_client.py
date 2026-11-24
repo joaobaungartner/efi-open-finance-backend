@@ -21,6 +21,14 @@ class EfiUnexpectedResponse(httpx.HTTPError):
         self.status_code = status_code
 
 
+class EfiOAuthError(httpx.HTTPError):
+    """HTTP or response failure while obtaining a token before sending Pix."""
+
+    def __init__(self, error: httpx.HTTPError):
+        super().__init__("Falha na etapa OAuth Efí")
+        self.error = error
+
+
 class EfiOpenFinanceClient:
     """Cliente Efí com mTLS e iniciação Pix restrita à homologação."""
 
@@ -115,7 +123,12 @@ class EfiOpenFinanceClient:
             verify=ssl_context,
             timeout=20,
         ) as client:
-            token = self._token(client)
+            try:
+                token = self._token(client)
+            except httpx.HTTPError as exc:
+                if idempotency_key is not None:
+                    raise EfiOAuthError(exc) from exc
+                raise
             response = client.request(
                 method,
                 endpoint,
