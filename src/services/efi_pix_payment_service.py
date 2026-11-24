@@ -3,6 +3,7 @@ import json
 import re
 from decimal import Decimal
 
+from entities.efi_pix_request import PixByKeyRequest
 from repositories.efi_pix_payment_repository import EfiPixPaymentRepository
 from services.efi_api_client import EfiConfigurationError, EfiOpenFinanceClient
 
@@ -57,26 +58,9 @@ class EfiPixPaymentService:
         ):
             raise ValueError("Instituição de origem inválida")
 
-        if not isinstance(payload, dict) or not all(
-            isinstance(payload.get(field), dict)
-            for field in ("pagador", "favorecido", "pagamento")
-        ):
-            raise ValueError("Payload Pix inválido")
-
-        value = payload["pagamento"].get("valor")
-
-        if (
-            not isinstance(value, str)
-            or re.fullmatch(
-                r"(?:0|[1-9][0-9]{0,15})\.[0-9]{2}",
-                value,
-            ) is None
-        ):
-            raise ValueError("Valor Pix inválido")
-
-        amount = Decimal(value)
-        if amount <= 0:
-            raise ValueError("Valor Pix deve ser positivo")
+        request = PixByKeyRequest.model_validate(payload)
+        payload = request.model_dump(exclude_none=True)
+        amount = Decimal(request.pagamento.valor)
 
         # O hash representa os dados completos da solicitação.
         canonical = json.dumps(

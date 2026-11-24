@@ -53,7 +53,7 @@ def setup_service():
 
 def payload(valor="10.00"):
     return {
-        "pagador": {"idParticipante": "teste"},
+        "pagador": {"idParticipante": "teste", "cpf": "52998224725"},
         "favorecido": {"chave": "chave-teste"},
         "pagamento": {"valor": valor},
     }
