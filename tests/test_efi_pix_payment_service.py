@@ -162,3 +162,72 @@ def test_valor_invalido_nao_cria_pagamento(setup_service):
 
     assert client.calls == []
     assert repo.get_by_idempotency_key("pix-001") is None
+
+
+def test_id_proprio_persistido_antes_do_post(
+    setup_service, monkeypatch
+):
+    service, repo, client = setup_service
+    original = client.start_pix
+
+    def verificar_antes_do_envio(payload, *, idempotency_key):
+        pagamento = repo.get_by_idempotency_key(
+            idempotency_key
+        )
+
+        assert pagamento is not None
+        assert pagamento.id_proprio is not None
+        assert pagamento.status == "submitting"
+        assert (
+            payload["pagamento"]["idProprio"]
+            == pagamento.id_proprio
+        )
+
+        return original(
+            payload,
+            idempotency_key=idempotency_key,
+        )
+
+    monkeypatch.setattr(
+        client, "start_pix", verificar_antes_do_envio
+    )
+
+    result = enviar(service)
+    pagamento = repo.get_by_idempotency_key("pix-001")
+
+    assert result["status"] == "awaiting_authorization"
+    assert result["id_proprio"] == pagamento.id_proprio
+    assert len(client.calls) == 1
+
+
+def test_id_proprio_permanece_apos_timeout(setup_service):
+    service, repo, client = setup_service
+    client.error = httpx.ReadTimeout("timeout simulado")
+
+    primeiro = enviar(service)
+    segundo = enviar(service)
+
+    pagamento = repo.get_by_idempotency_key("pix-001")
+
+    assert primeiro["status"] == "unknown"
+    assert segundo["status"] == "unknown"
+    assert primeiro["id_proprio"] == segundo["id_proprio"]
+    assert primeiro["id_proprio"] == pagamento.id_proprio
+    assert len(client.calls) == 1
+
+
+def test_nao_aceita_id_proprio_externo(setup_service):
+    service, repo, client = setup_service
+
+    dados = payload()
+    dados["pagamento"]["idProprio"] = "id-fornecido"
+
+    with pytest.raises(ValueError, match="idProprio"):
+        service.submit(
+            idempotency_key="pix-001",
+            origin_institution="stone-test",
+            payload=dados,
+        )
+
+    assert repo.get_by_idempotency_key("pix-001") is None
+    assert client.calls == []

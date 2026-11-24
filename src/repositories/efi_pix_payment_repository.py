@@ -1,4 +1,5 @@
 from decimal import Decimal
+from uuid import uuid4
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -60,6 +61,7 @@ class EfiPixPaymentRepository:
         payment = EfiPixPaymentModel(
             idempotency_key=idempotency_key,
             request_hash=request_hash,
+            id_proprio=f"v7-{uuid4().hex}",
             amount=amount,
             origin_institution=origin_institution,
             status="draft",
@@ -106,6 +108,7 @@ class EfiPixPaymentRepository:
             .where(
                 EfiPixPaymentModel.idempotency_key == key,
                 EfiPixPaymentModel.status == "draft",
+                EfiPixPaymentModel.id_proprio.is_not(None),
             )
             .values(status="submitting")
         )

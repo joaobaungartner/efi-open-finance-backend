@@ -167,3 +167,37 @@ def test_nao_marca_unknown_apos_receber_autorizacao(repo):
 
     payment = repo.get_by_idempotency_key("pix-001")
     assert payment.status == "awaiting_authorization"
+
+
+def test_id_proprio_unico_entre_solicitacoes(repo):
+    primeiro, _ = reservar(repo, chave="pix-001")
+    segundo, _ = reservar(repo, chave="pix-002")
+
+    assert primeiro.id_proprio.startswith("v7-")
+    assert segundo.id_proprio.startswith("v7-")
+    assert primeiro.id_proprio != segundo.id_proprio
+
+    repetido, criado = reservar(repo, chave="pix-001")
+
+    assert criado is False
+    assert repetido.id_proprio == primeiro.id_proprio
+
+
+def test_registro_legado_sem_id_nao_pode_ser_enviado(repo):
+    pagamento = EfiPixPaymentModel(
+        idempotency_key="pix-legado",
+        request_hash="a" * 64,
+        id_proprio=None,
+        amount=Decimal("10.00"),
+        origin_institution="stone-test",
+        status="draft",
+    )
+
+    repo.session.add(pagamento)
+    repo.session.commit()
+
+    assert repo.claim_for_submission("pix-legado") is False
+
+    atualizado = repo.get_by_idempotency_key("pix-legado")
+    assert atualizado.status == "draft"
+    assert atualizado.id_proprio is None

@@ -25,6 +25,7 @@ class EfiPixPaymentService:
 
         return {
             "id": payment.id,
+            "id_proprio": payment.id_proprio,
             "status": payment.status,
             "efi_payment_id": payment.efi_payment_id,
             "redirect_uri": payment.redirect_uri,
@@ -59,6 +60,12 @@ class EfiPixPaymentService:
             raise ValueError("Instituição de origem inválida")
 
         request = PixByKeyRequest.model_validate(payload)
+
+        if request.pagamento.idProprio is not None:
+            raise ValueError(
+                "idProprio deve ser gerado pela plataforma V7"
+            )
+
         payload = request.model_dump(exclude_none=True)
         amount = Decimal(request.pagamento.valor)
 
@@ -78,7 +85,7 @@ class EfiPixPaymentService:
             canonical.encode("utf-8")
         ).hexdigest()
 
-        _, created = self.repository.reserve(
+        payment, created = self.repository.reserve(
             idempotency_key=idempotency_key,
             request_hash=request_hash,
             amount=amount,
@@ -92,6 +99,14 @@ class EfiPixPaymentService:
         # Transição atômica: draft -> submitting.
         if not self.repository.claim_for_submission(idempotency_key):
             return self._result(idempotency_key)
+
+        if not payment.id_proprio:
+            raise RuntimeError(
+                "idProprio não persistido. Pix não enviado."
+            )
+
+        # O mesmo identificador salvo no banco vai para a Efí.
+        payload["pagamento"]["idProprio"] = payment.id_proprio
 
         try:
             response = self.client.start_pix(
