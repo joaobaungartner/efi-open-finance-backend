@@ -27,6 +27,10 @@ class EfiPixPaymentModel(Base):
         String(64), nullable=False
     )
 
+    id_proprio: Mapped[str | None] = mapped_column(
+        String(100), unique=True, index=True, nullable=True
+    )
+
     efi_payment_id: Mapped[str | None] = mapped_column(
         String(300), unique=True, index=True, nullable=True
     )

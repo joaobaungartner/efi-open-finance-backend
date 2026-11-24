@@ -63,3 +63,29 @@ def test_valor_deve_ser_positivo(session, valor):
         session.commit()
 
     session.rollback()
+
+def test_id_proprio_opcional(session):
+    pagamento = criar_pagamento(chave="pix-sem-id-proprio")
+
+    session.add(pagamento)
+    session.commit()
+    session.refresh(pagamento)
+
+    assert pagamento.id_proprio is None
+
+def test_id_proprio_unico(session):
+    primeiro = criar_pagamento(chave="pix-001")
+    primeiro.id_proprio = "v7-operacao-001"
+
+    session.add(primeiro)
+    session.commit()
+
+    segundo = criar_pagamento(chave="pix-002")
+    segundo.id_proprio = "v7-operacao-001"
+
+    session.add(segundo)
+
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+    session.rollback()
