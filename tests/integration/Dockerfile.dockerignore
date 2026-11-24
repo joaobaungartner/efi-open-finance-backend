@@ -1,0 +1,15 @@
+**
+!requirements.txt
+!requirements-dev.txt
+!pyproject.toml
+!alembic.ini
+!alembic/
+!alembic/**/*.py
+!src/
+!src/**/*.py
+!tests/
+!tests/conftest.py
+!tests/integration/
+!tests/integration/commit_proxy.py
+!tests/integration/test_pix_postgres.py
+**/__pycache__/
