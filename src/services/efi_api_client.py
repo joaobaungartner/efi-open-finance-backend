@@ -1,3 +1,4 @@
+import re
 import ssl
 import tempfile
 from pathlib import Path
@@ -81,7 +82,14 @@ class EfiOpenFinanceClient:
             raise EfiConfigurationError("Efí não retornou access_token")
         return token
 
-    def _request(self, method: str, endpoint: str, body: dict | None = None) -> dict:
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        body: dict | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict:
         with httpx.Client(
             base_url=self.settings.efi_api_base,
             verify=self._ssl_context(),
@@ -91,18 +99,34 @@ class EfiOpenFinanceClient:
             response = client.request(
                 method,
                 endpoint,
-                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    **(
+                        {"x-idempotency-key": idempotency_key}
+                        if idempotency_key is not None
+                        else {}
+                    ),
+                },
                 json=body,
             )
             response.raise_for_status()
             return response.json()
 
-    def start_pix(self, payload: dict) -> dict:
-        """Solicita iniciação Pix exclusivamente em Homologação."""
+    def start_pix(self, payload: dict, *, idempotency_key: str) -> dict:
+        """Solicita Pix com idempotência exclusivamente em Homologação."""
         if self.settings.efi_environment != "homologation":
             raise EfiConfigurationError(
                 "Iniciação Pix bloqueada fora de Homologação"
             )
+
+        if (
+            not isinstance(idempotency_key, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9._:-]{1,128}", idempotency_key
+            ) is None
+        ):
+            raise ValueError("Chave de idempotência inválida")
 
         required = ("pagador", "favorecido", "pagamento")
         if not isinstance(payload, dict) or not all(
@@ -110,7 +134,12 @@ class EfiOpenFinanceClient:
         ):
             raise ValueError("Payload Pix inválido")
 
-        return self._request("POST", "/v1/pagamentos/pix", payload)
+        return self._request(
+            "POST",
+            "/v1/pagamentos/pix",
+            payload,
+            idempotency_key=idempotency_key,
+        )
 
     def get_participants(self) -> dict:
         return self._request("GET", "/v1/participantes")
