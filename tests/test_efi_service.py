@@ -102,11 +102,11 @@ def test_start_pix_homologation(monkeypatch):
 
     monkeypatch.setattr(api, "_request", fake_request)
 
-    resultado = api.start_pix(payload, idempotency_key="pix-teste-001")
+    resultado = api.start_pix(payload, idempotency_key=("a" * 72))
 
     assert resultado["identificadorPagamento"] == "urn:efi:teste"
     assert chamadas == [
-        ("POST", "/v1/pagamentos/pix", payload, "pix-teste-001")
+        ("POST", "/v1/pagamentos/pix", payload, ("a" * 72))
     ]
 
 
@@ -135,7 +135,7 @@ def test_start_pix_requires_payload():
     api = EfiOpenFinanceClient(settings())
 
     with pytest.raises(ValueError, match="Payload Pix inválido"):
-        api.start_pix({"pagador": {}}, idempotency_key="pix-invalido-001")
+        api.start_pix({"pagador": {}}, idempotency_key=("a" * 72))
 
 
 def test_start_pix_rejects_invalid_idempotency_key():
@@ -180,11 +180,11 @@ def test_start_pix_sends_idempotency_header(monkeypatch):
 
     api.start_pix(
         payload,
-        idempotency_key="pix-teste-001",
+        idempotency_key=("a" * 72),
     )
 
     args, kwargs = fake_client.request.call_args
 
     assert args == ("POST", "/v1/pagamentos/pix")
     assert kwargs["json"] == payload
-    assert kwargs["headers"]["x-idempotency-key"] == "pix-teste-001"
+    assert kwargs["headers"]["x-idempotency-key"] == ("a" * 72)

@@ -109,9 +109,15 @@ class EfiPixPaymentService:
         payload["pagamento"]["idProprio"] = payment.id_proprio
 
         try:
+            # Chave bancaria estavel derivada do idProprio persistido.
+            # Nunca usar diretamente a chave local no cabecalho Efi.
+            bank_key = hashlib.sha512(
+                f"efi-pix-v1:{payment.id_proprio}".encode("ascii")
+            ).hexdigest()[:72]
+
             response = self.client.start_pix(
                 payload,
-                idempotency_key=idempotency_key,
+                idempotency_key=bank_key,
             )
 
             if not isinstance(response, dict):

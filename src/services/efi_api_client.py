@@ -126,7 +126,7 @@ class EfiOpenFinanceClient:
         if (
             not isinstance(idempotency_key, str)
             or re.fullmatch(
-                r"[A-Za-z0-9._:-]{1,128}", idempotency_key
+                r"[A-Za-z0-9]{72}", idempotency_key
             ) is None
         ):
             raise ValueError("Chave de idempotência inválida")

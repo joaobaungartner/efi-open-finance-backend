@@ -171,9 +171,16 @@ def test_id_proprio_persistido_antes_do_post(
     original = client.start_pix
 
     def verificar_antes_do_envio(payload, *, idempotency_key):
-        pagamento = repo.get_by_idempotency_key(
-            idempotency_key
-        )
+        pagamento = repo.get_by_idempotency_key("pix-001")
+
+        import hashlib
+        expected = hashlib.sha512(
+            f"efi-pix-v1:{pagamento.id_proprio}".encode("ascii")
+        ).hexdigest()[:72]
+
+        assert idempotency_key == expected
+        assert len(idempotency_key) == 72
+        assert idempotency_key.isalnum()
 
         assert pagamento is not None
         assert pagamento.id_proprio is not None
@@ -231,3 +238,24 @@ def test_nao_aceita_id_proprio_externo(setup_service):
 
     assert repo.get_by_idempotency_key("pix-001") is None
     assert client.calls == []
+
+
+def test_chaves_bancarias_distintas(setup_service):
+    service, repo, client = setup_service
+
+    enviar(service, key="pix-001")
+    primeira_chave = client.calls[0]
+
+    client.response = {
+        "identificadorPagamento": "urn:efi:teste-456",
+        "redirectURI": "https://example.com/autorizar",
+    }
+
+    enviar(service, key="pix-002")
+    segunda_chave = client.calls[1]
+
+    assert primeira_chave != segunda_chave
+
+    for chave in (primeira_chave, segunda_chave):
+        assert len(chave) == 72
+        assert chave.isalnum()
