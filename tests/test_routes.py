@@ -127,3 +127,225 @@ def test_webhook_verificacao_efi(client):
     # Nenhum desses testes deve criar um evento financeiro.
     with Session(engine) as session:
         assert session.query(EfiWebhookEventModel).count() == 0
+
+
+def _criar_pix_para_rota(chave, *, unknown=False):
+    from decimal import Decimal
+    from sqlalchemy.orm import Session
+    from repositories.efi_pix_payment_repository import (
+        EfiPixPaymentRepository,
+    )
+
+    with Session(engine) as db:
+        repo = EfiPixPaymentRepository(db)
+
+        payment, _ = repo.reserve(
+            idempotency_key=chave,
+            request_hash="a" * 64,
+            amount=Decimal("10.00"),
+            origin_institution="stone-test",
+        )
+
+        payment_id = payment.id
+        id_proprio = payment.id_proprio
+
+        if unknown:
+            assert repo.claim_for_submission(chave)
+            assert repo.mark_unknown(chave)
+
+        return payment_id, id_proprio
+
+
+def _admin_headers():
+    return {
+        "X-Admin-Key": (
+            get_settings().admin_api_key.get_secret_value()
+        )
+    }
+
+
+def test_pix_leitura_exige_admin(client):
+    url = "/internal/efi/pix/pagamentos"
+
+    assert client.get(url).status_code == 401
+    assert client.get(
+        url, headers={"X-Admin-Key": "incorreta"}
+    ).status_code == 401
+
+    result = client.get(url, headers=_admin_headers())
+
+    assert result.status_code == 200
+    assert result.json()["total"] == 0
+
+
+def test_pix_listagem_filtro_paginacao(client):
+    _criar_pix_para_rota("pix-lista-001")
+    _criar_pix_para_rota("pix-lista-002", unknown=True)
+
+    result = client.get(
+        "/internal/efi/pix/pagamentos",
+        params={"status": "unknown", "quantidade": 1},
+        headers=_admin_headers(),
+    )
+
+    assert result.status_code == 200
+
+    data = result.json()
+
+    assert data["total"] == 1
+    assert len(data["pagamentos"]) == 1
+    assert data["pagamentos"][0]["status"] == "unknown"
+    assert data["pagamentos"][0]["valor"] == "10.00"
+
+    # Não expor chave de idempotência nem URL de autorização.
+    assert "idempotency_key" not in data["pagamentos"][0]
+    assert "redirect_uri" not in data["pagamentos"][0]
+
+
+def test_pix_inspecao_unknown_nao_escreve(client, monkeypatch):
+    from services.efi_api_client import EfiOpenFinanceClient
+    from models.efi_pix_payment_model import EfiPixPaymentModel
+    from sqlalchemy.orm import Session
+
+    payment_id, id_proprio = _criar_pix_para_rota(
+        "pix-rota-unknown", unknown=True
+    )
+
+    chamadas = []
+
+    def consulta_falsa(
+        self, inicio, fim, *, pagina, quantidade
+    ):
+        chamadas.append(pagina)
+
+        return {
+            "pagamentos": [
+                {
+                    "idProprio": id_proprio,
+                    "identificadorPagamento": "urn:efi:teste",
+                    "valor": "10.00",
+                    "status": "pendente",
+                }
+            ],
+            "total": 1,
+            "proximo": None,
+        }
+
+    monkeypatch.setattr(
+        EfiOpenFinanceClient,
+        "list_pix_payments",
+        consulta_falsa,
+    )
+
+    url = (
+        f"/internal/efi/pix/pagamentos/"
+        f"{payment_id}/reconciliacao"
+    )
+
+    params = {
+        "inicio": "2026-11-01",
+        "fim": "2026-11-24",
+    }
+
+    assert client.get(url, params=params).status_code == 401
+    assert chamadas == []
+
+    response = client.get(
+        url,
+        params=params,
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["diagnostico"]
+        == "correspondencia_consistente"
+    )
+    assert chamadas == [1]
+
+    with Session(engine) as db:
+        payment = db.get(EfiPixPaymentModel, payment_id)
+
+        assert payment.status == "unknown"
+        assert payment.efi_payment_id is None
+
+
+def test_pix_inspecao_rejeita_estado_diferente(client, monkeypatch):
+    from services.efi_api_client import EfiOpenFinanceClient
+
+    payment_id, _ = _criar_pix_para_rota(
+        "pix-rota-draft"
+    )
+
+    def nao_consultar(*args, **kwargs):
+        raise AssertionError("Consulta bancária indevida")
+
+    monkeypatch.setattr(
+        EfiOpenFinanceClient,
+        "list_pix_payments",
+        nao_consultar,
+    )
+
+    response = client.get(
+        f"/internal/efi/pix/pagamentos/{payment_id}/reconciliacao",
+        params={
+            "inicio": "2026-11-01",
+            "fim": "2026-11-24",
+        },
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 409
+
+
+def test_pix_inspecao_mascara_falha_externa(client, monkeypatch):
+    import httpx
+    from services.efi_api_client import EfiOpenFinanceClient
+
+    payment_id, _ = _criar_pix_para_rota(
+        "pix-rota-timeout", unknown=True
+    )
+
+    def falhar(*args, **kwargs):
+        raise httpx.ReadTimeout("detalhe_bancario_privado")
+
+    monkeypatch.setattr(
+        EfiOpenFinanceClient,
+        "list_pix_payments",
+        falhar,
+    )
+
+    response = client.get(
+        f"/internal/efi/pix/pagamentos/{payment_id}/reconciliacao",
+        params={
+            "inicio": "2026-11-01",
+            "fim": "2026-11-24",
+        },
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 502
+    assert "detalhe_bancario_privado" not in response.text
+
+
+def test_pix_parametros_invalidos(client):
+    url = "/internal/efi/pix/pagamentos"
+
+    response = client.get(
+        url,
+        params={"quantidade": 101},
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 422
+
+    response = client.get(
+        "/internal/efi/pix/pagamentos/1/reconciliacao",
+        params={
+            "inicio": "2026-11-24",
+            "fim": "2026-11-01",
+        },
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 422
