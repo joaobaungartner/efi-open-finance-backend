@@ -1,4 +1,5 @@
 import re
+from datetime import date
 import ssl
 import tempfile
 from pathlib import Path
@@ -89,6 +90,7 @@ class EfiOpenFinanceClient:
         body: dict | None = None,
         *,
         idempotency_key: str | None = None,
+        params: dict | None = None,
     ) -> dict:
         with httpx.Client(
             base_url=self.settings.efi_api_base,
@@ -109,6 +111,7 @@ class EfiOpenFinanceClient:
                     ),
                 },
                 json=body,
+                params=params,
             )
             response.raise_for_status()
             return response.json()
@@ -139,6 +142,57 @@ class EfiOpenFinanceClient:
             "/v1/pagamentos/pix",
             payload,
             idempotency_key=idempotency_key,
+        )
+
+    def list_pix_payments(
+        self,
+        inicio: str,
+        fim: str,
+        *,
+        pagina: int = 1,
+        quantidade: int = 50,
+    ) -> dict:
+        """Consulta pagamentos Pix; não modifica estados locais."""
+        if self.settings.efi_environment != "homologation":
+            raise EfiConfigurationError(
+                "Consulta Pix limitada à Homologação nesta etapa"
+            )
+
+        def parse_date(value: str) -> date:
+            if (
+                not isinstance(value, str)
+                or re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None
+            ):
+                raise ValueError("Data inválida: use AAAA-MM-DD")
+            try:
+                return date.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError("Data inválida") from exc
+
+        start = parse_date(inicio)
+        end = parse_date(fim)
+
+        if end < start:
+            raise ValueError("Data final anterior à inicial")
+
+        if type(pagina) is not int or pagina < 1:
+            raise ValueError("Página inválida")
+
+        if (
+            type(quantidade) is not int
+            or not 1 <= quantidade <= 100
+        ):
+            raise ValueError("Quantidade inválida")
+
+        return self._request(
+            "GET",
+            "/v1/pagamentos/pix",
+            params={
+                "inicio": start.isoformat(),
+                "fim": end.isoformat(),
+                "pagina": pagina,
+                "quantidade": quantidade,
+            },
         )
 
     def get_participants(self) -> dict:
