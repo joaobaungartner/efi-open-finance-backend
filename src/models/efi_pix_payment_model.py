@@ -35,6 +35,14 @@ class EfiPixPaymentModel(Base):
         String(300), unique=True, index=True, nullable=True
     )
 
+    efi_http_status: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+
+    efi_error_code: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
+
     status: Mapped[str] = mapped_column(
         String(40), default="draft", nullable=False
     )

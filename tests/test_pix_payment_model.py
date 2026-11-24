@@ -89,3 +89,28 @@ def test_id_proprio_unico(session):
         session.commit()
 
     session.rollback()
+
+def test_pagamento_novo_sem_diagnostico(session):
+    pagamento = criar_pagamento(chave="pix-sem-erro")
+
+    session.add(pagamento)
+    session.commit()
+    session.refresh(pagamento)
+
+    assert pagamento.efi_http_status is None
+    assert pagamento.efi_error_code is None
+
+def test_persistir_diagnostico_validacao(session):
+    pagamento = criar_pagamento(chave="pix-com-erro")
+
+    pagamento.status = "validation_error"
+    pagamento.efi_http_status = 422
+    pagamento.efi_error_code = "parametro_invalido"
+
+    session.add(pagamento)
+    session.commit()
+    session.refresh(pagamento)
+
+    assert pagamento.status == "validation_error"
+    assert pagamento.efi_http_status == 422
+    assert pagamento.efi_error_code == "parametro_invalido"
