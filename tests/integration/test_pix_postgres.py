@@ -14,12 +14,12 @@ import httpx
 import pytest
 from alembic import command
 from alembic.config import Config
+from commit_proxy import commit_proxy
 from fastapi import Response
 from sqlalchemy import URL, create_engine, inspect, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from commit_proxy import commit_proxy
 from config.settings import Settings
 from database import database
 from models.efi_pix_investigation_model import EfiPixInvestigationModel
@@ -343,3 +343,65 @@ def test_investigacoes_concorrentes_preservam_pagamento(postgres, monkeypatch):
     assert after.status == before.status == "submitting"
     assert after.updated_at == before.updated_at
     assert after.efi_payment_id is None
+
+
+def test_gestao_transferencia_concorrente_e_exclusion_constraint(postgres):
+    from datetime import datetime
+
+    from fastapi import HTTPException
+    from sqlalchemy.exc import IntegrityError
+
+    from entities.gestao import NovoVinculo, Transferencia
+    from models.gestao import Auditoria, Cliente, Conta, Instituicao, Terminal, Vinculo
+    from use_cases.gestao.index import cadastrar_vinculo, transferir_terminal
+
+    with Session(postgres, expire_on_commit=False) as db, db.begin():
+        origem = db.scalar(select(Instituicao).where(Instituicao.codigo == "stone"))
+        assert origem.nome == "Stone"
+        a = Cliente(codigo="PG-A", nome="Cliente fictício A")
+        b = Cliente(codigo="PG-B", nome="Cliente fictício B")
+        conta = Conta(instituicao_id=origem.id, referencia="PG-CONTRATO", ambiente="simulacao")
+        db.add_all([a, b, conta])
+        db.flush()
+        terminal = Terminal(conta_id=conta.id, identificador="PG-01", apelido="Terminal fictício")
+        db.add(terminal)
+        db.flush()
+        terminal_id, a_id, b_id = terminal.id, a.id, b.id
+
+    with Session(postgres) as db:
+        vinculo = cadastrar_vinculo(
+            terminal_id, NovoVinculo(cliente_id=a_id, inicio="2025-01-01T00:00:00Z"), db
+        )
+
+    barrier = Barrier(2, timeout=10)
+
+    def transferir(when):
+        input_data = Transferencia(
+            cliente_id=b_id, vinculo_anterior_id=vinculo["id"], fim_anterior=None,
+            efetiva_em=when, motivo="Transferência fictícia",
+        )
+        with Session(postgres) as db:
+            barrier.wait()
+            try:
+                transferir_terminal(terminal_id, input_data, db)
+            except HTTPException as exc:
+                return exc.status_code
+            return 201
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(transferir, ["2025-02-01T00:00:00Z", "2025-03-01T00:00:00Z"])) == [201, 409]
+
+    with Session(postgres) as db:
+        rows = db.scalars(select(Vinculo).where(Vinculo.terminal_id == terminal_id).order_by(Vinculo.inicio)).all()
+        anterior, atual = rows
+        assert (anterior.cliente_id, atual.cliente_id) == (a_id, b_id)
+        assert anterior.fim == atual.inicio and atual.fim is None
+        assert db.scalars(select(Auditoria.acao).where(
+            Auditoria.entidade == "terminal", Auditoria.entidade_id == terminal_id,
+        ).order_by(Auditoria.id)).all() == ["criacao_vinculo", "transferencia"]
+
+        # Bypass the API locks to validate that the database itself rejects overlaps.
+        db.add(Vinculo(terminal_id=terminal_id, cliente_id=a_id, inicio=datetime(2025, 4, 1)))
+        with pytest.raises(IntegrityError) as exc:
+            db.flush()
+        assert exc.value.orig.sqlstate == "23P01"
