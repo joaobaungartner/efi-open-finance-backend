@@ -113,6 +113,8 @@ class EfiOpenFinanceClient:
         idempotency_key: str | None = None,
         params: dict | None = None,
     ) -> dict:
+        if self.settings.dry_run:
+            raise EfiConfigurationError("Acesso externo à Efí bloqueado em DRY_RUN")
         try:
             ssl_context = self._ssl_context()
         except OSError as exc:
@@ -148,6 +150,8 @@ class EfiOpenFinanceClient:
 
     def start_pix(self, payload: dict, *, idempotency_key: str) -> dict:
         """Solicita Pix com idempotência exclusivamente em Homologação."""
+        if self.settings.dry_run:
+            raise EfiConfigurationError("Iniciação Pix bloqueada em DRY_RUN")
         if self.settings.efi_environment != "homologation":
             raise EfiConfigurationError(
                 "Iniciação Pix bloqueada fora de Homologação"

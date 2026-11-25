@@ -74,6 +74,8 @@ class EfiPixPaymentService:
         payload: dict,
     ) -> dict:
         # Dupla proteção: serviço e cliente HTTP.
+        if getattr(self.client.settings, "dry_run", False):
+            raise EfiConfigurationError("Iniciação Pix bloqueada em DRY_RUN")
         if self.client.settings.efi_environment != "homologation":
             raise EfiConfigurationError(
                 "Iniciação Pix permitida apenas em Homologação"

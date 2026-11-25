@@ -26,6 +26,8 @@ app.add_middleware(
 
 @app.get("/health", tags=["health"])
 def health_check():
+    if settings.dry_run:
+        return {"status": "OK", "environment": "simulation", "dry_run": True}
     return {"status": "OK", "environment": settings.efi_environment}
 
 

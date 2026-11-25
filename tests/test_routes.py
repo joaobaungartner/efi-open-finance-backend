@@ -39,6 +39,93 @@ def test_health_and_redirect(client):
     assert "não concluída" in client.get("/openfinance/retorno?erro=acesso_negado").text
 
 
+@pytest.mark.parametrize("institution", ["sim-stone", "sim-pagbank"])
+def test_simulacao_valida_sem_envio_ou_registro(client, monkeypatch, institution):
+    from services.efi_api_client import EfiOpenFinanceClient
+
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("Simulação tentou acessar a Efí")
+
+    monkeypatch.setattr(get_settings(), "dry_run", True)
+    monkeypatch.setattr(EfiOpenFinanceClient, "_request", fail_if_called)
+    url = "/internal/efi/pix/simulacoes"
+    body = {"instituicao": institution, "favorecido": "recebedor@example.invalid", "valor": "12.34"}
+    assert client.get("/health").json()["environment"] == "simulation"
+    assert client.post(url, json=body).status_code == 401
+    response = client.post(url, json=body, headers=_admin_headers())
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert "recebedor" not in response.text
+    assert "00000000191" not in response.text
+    result = response.json()
+    assert result["previa"]["pagador"]["idParticipante"] == institution
+    assert result["previa"]["pagamento"]["valor"] == "12.34"
+    assert result["envio_bancario"] is result["pagamento_persistido"] is False
+    listed = client.get("/internal/efi/pix/pagamentos", headers=_admin_headers())
+    assert listed.json()["total"] == 0
+    participants = client.get("/internal/efi/participantes", headers=_admin_headers()).json()
+    assert participants["simulacao"] is True
+    assert {item["identificador"] for item in participants["participantes"]} == {
+        "sim-stone", "sim-pagbank",
+    }
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [{"favorecido": "hidden@example.com"}, {"instituicao": "hidden"}, {"valor": "0.00"},
+     {"valor": "1.001"}, {"cpf": "hidden"}, {"valor": 12}],
+)
+def test_simulacao_rejeita_entradas_sem_ecoar_dados(client, monkeypatch, invalid):
+    monkeypatch.setattr(get_settings(), "dry_run", True)
+    body = {"instituicao": "sim-stone", "favorecido": "teste@example.invalid", "valor": "10.00"}
+    response = client.post("/internal/efi/pix/simulacoes", json=body | invalid, headers=_admin_headers())
+    assert response.status_code == 422
+    assert "hidden" not in response.text
+
+
+def test_simulacao_exige_modo_ativo(client):
+    response = client.post(
+        "/internal/efi/pix/simulacoes",
+        json={"instituicao": "sim-stone", "favorecido": "teste@example.invalid", "valor": "10.00"},
+        headers=_admin_headers(),
+    )
+    assert response.status_code == 409
+
+
+def test_dry_run_bloqueia_servico_e_cliente_antes_do_acesso_externo(monkeypatch):
+    from services.efi_api_client import EfiConfigurationError, EfiOpenFinanceClient
+    from services.efi_pix_payment_service import EfiPixPaymentService
+
+    monkeypatch.setattr(get_settings(), "dry_run", True)
+    bank = EfiOpenFinanceClient()
+    with pytest.raises(EfiConfigurationError, match="DRY_RUN"):
+        EfiPixPaymentService(None, bank).submit(
+            idempotency_key="test", origin_institution="stone", payload={}
+        )
+    with pytest.raises(EfiConfigurationError, match="DRY_RUN"):
+        bank.start_pix({}, idempotency_key="x" * 72)
+    with pytest.raises(EfiConfigurationError, match="DRY_RUN"):
+        bank.get_participants()
+
+
+def test_diagnostico_expoe_apenas_codigos_conhecidos(client):
+    from models.efi_pix_payment_model import EfiPixPaymentModel
+
+    known, _ = _criar_pix_para_rota("known", unknown=True)
+    other, _ = _criar_pix_para_rota("other", unknown=True)
+    with Session(engine) as session:
+        session.get(EfiPixPaymentModel, known).efi_error_code = "efi_oauth_http_401"
+        session.get(EfiPixPaymentModel, known).efi_http_status = 401
+        session.get(EfiPixPaymentModel, other).efi_error_code = "conteudo-nao-autorizado"
+        session.commit()
+
+    response = client.get("/internal/efi/pix/pagamentos", headers=_admin_headers())
+    rows = {row["id"]: row for row in response.json()["pagamentos"]}
+    assert rows[known]["diagnostico"] == {"codigo": "efi_oauth_http_401", "http_status": 401}
+    assert rows[other]["diagnostico"] is None
+    assert "conteudo-nao-autorizado" not in response.text
+
+
 def test_webhook_rejects_missing_or_wrong_hash(client):
     payload = {"identificadorPagamento": "urn:efi:1", "status": "aceito", "tipo": "pagamento"}
     assert client.post("/webhooks/efi", json=payload).status_code == 401

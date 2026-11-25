@@ -1,4 +1,5 @@
 from functools import lru_cache
+from os import getenv
 from pathlib import Path
 
 from pydantic import Field, SecretStr, model_validator
@@ -11,6 +12,7 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "dev"
+    dry_run: bool = False
     client_url: str = "http://localhost:5173"
     database_url: str = "sqlite:///./efi_dev.sqlite3"
 
@@ -29,6 +31,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_environment(self):
+        if self.dry_run and self.app_env not in ("dev", "test"):
+            raise ValueError("DRY_RUN requer APP_ENV=dev ou test")
         if self.app_env not in ("dev", "test", "prod"):
             raise ValueError("APP_ENV deve ser dev, test ou prod")
         if self.efi_environment not in ("homologation", "production"):
@@ -53,4 +57,6 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    if getenv("EFI_LOCAL_SANDBOX") == "1":
+        return Settings(_env_file=None)
     return Settings()

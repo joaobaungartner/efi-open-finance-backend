@@ -17,6 +17,8 @@ Backend mínimo baseado na estrutura de `murilozgodoy/template-backend-repo`: Fa
 
 ## 1. Executar localmente (Windows / Linux)
 
+Para abrir a interface React e simular Pix com Stone e PagBank, siga o [guia do painel local](docs/painel-local.md). O launcher inicia a API em `DRY_RUN` com um arquivo SQLite temporário e uma chave administrativa temporária.
+
 Requisitos: Python 3.12+ e, para PostgreSQL, Docker. Em desenvolvimento inicial, a configuração padrão utiliza SQLite para reduzir dependências; a arquitetura é a mesma e é possível trocar por PostgreSQL via `DATABASE_URL`.
 
 ```bash

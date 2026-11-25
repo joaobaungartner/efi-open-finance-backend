@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from config.settings import get_settings
 from database.database import get_db
 from middlewares.require_admin_api_key import require_admin_api_key
 from models.efi_pix_investigation_model import EfiPixInvestigationModel
@@ -42,6 +43,17 @@ STATUS_DESCRIPTIONS = {
     "awaiting_authorization": "Autorização pendente, sem confirmação de liquidação",
 }
 NO_STORE = {"Cache-Control": "no-store"}
+HTTP_DIAGNOSTICS = {
+    "http_400", "http_401", "http_403", "http_422", "rate_limited",
+    "server_error", "http_unexpected", "invalid_response", "timeout",
+    "transport_error", "submission_unexpected_error",
+}
+DIAGNOSTIC_CODES = {
+    *(f"efi_{code}" for code in HTTP_DIAGNOSTICS if code != "submission_unexpected_error"),
+    *(f"efi_oauth_{code}" for code in HTTP_DIAGNOSTICS),
+    "local_configuration_error", "local_validation_error",
+    "local_persistence_error", "submission_unexpected_error",
+}
 
 
 def _utc_iso(value: datetime) -> str:
@@ -53,12 +65,14 @@ def _utc_iso(value: datetime) -> str:
 
 @router.get("/pagamentos")
 def listar_pagamentos(
+    response: Response,
     status: PixStatus | None = None,
     pagina: int = Query(1, ge=1, le=100000),
     quantidade: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
     """Lista pagamentos locais sem iniciar transferências."""
+    response.headers.update(NO_STORE)
     consulta = select(EfiPixPaymentModel)
     contagem = select(func.count()).select_from(EfiPixPaymentModel)
 
@@ -89,6 +103,14 @@ def listar_pagamentos(
                 "valor": str(p.amount),
                 "origin_institution": p.origin_institution,
                 "created_at": p.created_at.isoformat(),
+                "diagnostico": (
+                    {
+                        "codigo": p.efi_error_code,
+                        "http_status": p.efi_http_status,
+                    }
+                    if p.efi_error_code in DIAGNOSTIC_CODES
+                    else None
+                ),
             }
             for p in pagamentos
         ],
@@ -148,6 +170,10 @@ def inspecionar_pagamento(
 ):
     """Consulta a Efí e grava uma investigação local sem alterar o pagamento."""
     response.headers.update(NO_STORE)
+    if get_settings().dry_run:
+        raise HTTPException(
+            status_code=409, detail="Reconciliação remota indisponível em DRY_RUN", headers=NO_STORE
+        )
     if fim < inicio:
         raise HTTPException(
             status_code=422,
